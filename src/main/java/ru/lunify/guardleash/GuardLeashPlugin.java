@@ -143,17 +143,14 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
         }
 
         Player actor = event.getPlayer();
-        LeashSession existing = sessionsByTarget.get(target.getUniqueId());
-        if (existing != null) {
-            if (event.getHand() != EquipmentSlot.HAND) {
-                return;
-            }
-            event.setCancelled(true);
-            tryReleaseByPlayer(actor, existing);
+        if (!isValidLeashHand(actor, event.getHand()) || !isLeashItem(itemInHand(actor, event.getHand()))) {
             return;
         }
 
-        if (!isValidLeashHand(actor, event.getHand())) {
+        LeashSession existing = sessionsByTarget.get(target.getUniqueId());
+        if (existing != null) {
+            event.setCancelled(true);
+            tryReleaseByPlayer(actor, existing);
             return;
         }
 
@@ -164,10 +161,6 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
         }
         if (target.hasPermission(settings.bypassPermission)) {
             send(actor, "messages.target-bypass", actor, target, null);
-            return;
-        }
-        if (!isLeashItem(itemInHand(actor, event.getHand()))) {
-            send(actor, "messages.no-lead", actor, target, null);
             return;
         }
 
@@ -419,8 +412,13 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
         if (targetSession != null && settings.releaseWhenTargetQuits) {
             Player owner = onlinePlayer(targetSession.ownerUuid);
             if (canRestoreOnReconnect(targetSession)) {
-                pendingReconnectLeashes.put(player.getUniqueId(), PendingReconnectLeash.from(targetSession, System.currentTimeMillis()));
-                release(targetSession, owner, ReleaseReason.TARGET_QUIT, false, true);
+                boolean returnLeadNow = targetSession.mode == LeashMode.HOLDER && settings.returnLeadOnAutoRelease;
+                pendingReconnectLeashes.put(player.getUniqueId(), PendingReconnectLeash.from(
+                        targetSession,
+                        System.currentTimeMillis(),
+                        returnLeadNow && targetSession.consumedLead
+                ));
+                release(targetSession, owner, ReleaseReason.TARGET_QUIT, returnLeadNow, true);
             } else {
                 release(targetSession, owner, ReleaseReason.TARGET_QUIT, settings.returnLeadOnAutoRelease, true);
             }
@@ -628,9 +626,16 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
     }
 
     private boolean canRestoreOnReconnect(LeashSession session) {
-        return settings.restoreTargetLeashOnReconnect
-                && session.mode == LeashMode.HOLDER
-                && session.holderUuid != null;
+        if (!settings.restoreTargetLeashOnReconnect) {
+            return false;
+        }
+        if (session.mode == LeashMode.HOLDER) {
+            return session.holderUuid != null;
+        }
+        return session.mode == LeashMode.FENCE
+                && settings.fenceEnabled
+                && session.anchorLocation != null
+                && session.lockLocation != null;
     }
 
     private void tryRestoreReconnectLeash(UUID targetUuid) {
@@ -652,6 +657,12 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
             finishPendingReconnectWithoutRestore(pending, false);
             return;
         }
+
+        if (pending.mode == LeashMode.FENCE) {
+            tryRestoreFenceReconnectLeash(pending, target);
+            return;
+        }
+
         if (holder == null || !holder.isOnline() || !holder.getWorld().equals(target.getWorld())
                 || holder.getLocation().distance(target.getLocation()) > settings.reconnectRestoreRadius) {
             finishPendingReconnectWithoutRestore(pending, true);
@@ -664,6 +675,11 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
             return;
         }
 
+        boolean consumedLead = pending.consumedLead;
+        if (pending.leadReturnedOnQuit && pending.consumedLead) {
+            consumedLead = takeLeadForReconnect(holder);
+        }
+
         LeashSession session = new LeashSession(
                 target.getUniqueId(),
                 pending.ownerUuid,
@@ -672,7 +688,7 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
                 null,
                 null,
                 LeashMode.HOLDER,
-                pending.consumedLead,
+                consumedLead,
                 target.getLocation(),
                 target.getWalkSpeed(),
                 target.getFlySpeed()
@@ -690,9 +706,68 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
         actionbar(target, "messages.reconnected.actionbar-target", holder, target, target.getLocation());
     }
 
+    private void tryRestoreFenceReconnectLeash(PendingReconnectLeash pending, Player target) {
+        if (pending.anchorLocation == null || pending.anchorLocation.getWorld() == null) {
+            finishPendingReconnectWithoutRestore(pending, true);
+            return;
+        }
+
+        Block fence = pending.anchorLocation.getBlock();
+        if (!isFence(fence)) {
+            finishPendingReconnectWithoutRestore(pending, true);
+            return;
+        }
+
+        LivingEntity proxy = spawnProxy(target.getLocation());
+        if (proxy == null) {
+            finishPendingReconnectWithoutRestore(pending, true);
+            return;
+        }
+
+        Entity knot = findOrCreateKnot(fence);
+        if (!(knot instanceof LeashHitch)) {
+            proxy.remove();
+            finishPendingReconnectWithoutRestore(pending, true);
+            return;
+        }
+
+        Location lockLocation = pending.lockLocation == null ? target.getLocation() : pending.lockLocation.clone();
+        LeashSession session = new LeashSession(
+                target.getUniqueId(),
+                pending.ownerUuid,
+                null,
+                proxy.getUniqueId(),
+                knot.getUniqueId(),
+                pending.anchorLocation.clone(),
+                LeashMode.FENCE,
+                pending.consumedLead,
+                lockLocation,
+                target.getWalkSpeed(),
+                target.getFlySpeed()
+        );
+
+        pendingReconnectLeashes.remove(target.getUniqueId());
+        sessionsByTarget.put(target.getUniqueId(), session);
+        targetsByKnot.computeIfAbsent(knot.getUniqueId(), ignored -> new LinkedHashSet<>()).add(target.getUniqueId());
+        targetByProxy.put(proxy.getUniqueId(), target.getUniqueId());
+        proxy.setLeashHolder(knot);
+        applyMovementLock(target);
+        if (lockLocation.getWorld() != null && lockLocation.getWorld().equals(target.getWorld())) {
+            moveTarget(target, session.lockLocationWithView(target.getLocation()));
+        }
+
+        Player owner = onlinePlayer(pending.ownerUuid);
+        if (owner != null && owner.isOnline()) {
+            send(owner, "messages.reconnected-fence.actor", owner, target, fence.getLocation());
+            actionbar(owner, "messages.reconnected-fence.actionbar-actor", owner, target, fence.getLocation());
+        }
+        send(target, "messages.reconnected-fence.target", owner, target, fence.getLocation());
+        actionbar(target, "messages.reconnected-fence.actionbar-target", owner, target, fence.getLocation());
+    }
+
     private void finishPendingReconnectWithoutRestore(PendingReconnectLeash pending, boolean notifyOwner) {
         pendingReconnectLeashes.remove(pending.targetUuid);
-        if (pending.consumedLead && settings != null && settings.returnLeadOnAutoRelease) {
+        if (pending.consumedLead && !pending.leadReturnedOnQuit && settings != null && settings.returnLeadOnAutoRelease) {
             returnLeadToUuid(pending.ownerUuid, 1);
         }
         if (notifyOwner) {
@@ -981,6 +1056,36 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
         return true;
     }
 
+    private boolean takeLeadForReconnect(Player player) {
+        if (!settings.consumeLead) {
+            return false;
+        }
+        if (!settings.consumeLeadInCreative && player.getGameMode() == GameMode.CREATIVE) {
+            return false;
+        }
+
+        PlayerInventory inventory = player.getInventory();
+        ItemStack mainHand = inventory.getItemInMainHand();
+        if (isLeashItem(mainHand)) {
+            mainHand.setAmount(mainHand.getAmount() - 1);
+            return true;
+        }
+        ItemStack offHand = inventory.getItemInOffHand();
+        if (settings.allowOffhand && isLeashItem(offHand)) {
+            offHand.setAmount(offHand.getAmount() - 1);
+            return true;
+        }
+
+        for (ItemStack item : inventory.getStorageContents()) {
+            if (!isLeashItem(item)) {
+                continue;
+            }
+            item.setAmount(item.getAmount() - 1);
+            return true;
+        }
+        return false;
+    }
+
     private void giveLeadOrQueue(Player player, int amount) {
         Map<Integer, ItemStack> leftovers = player.getInventory().addItem(new ItemStack(settings.leashMaterial, amount));
         int missing = 0;
@@ -1236,23 +1341,37 @@ public final class GuardLeashPlugin extends JavaPlugin implements Listener, TabE
         private final UUID targetUuid;
         private final UUID ownerUuid;
         private final UUID holderUuid;
+        private final LeashMode mode;
+        private final Location anchorLocation;
+        private final Location lockLocation;
         private final boolean consumedLead;
+        private final boolean leadReturnedOnQuit;
         private final long createdAtMillis;
 
-        private PendingReconnectLeash(UUID targetUuid, UUID ownerUuid, UUID holderUuid, boolean consumedLead, long createdAtMillis) {
+        private PendingReconnectLeash(UUID targetUuid, UUID ownerUuid, UUID holderUuid, LeashMode mode,
+                                      Location anchorLocation, Location lockLocation, boolean consumedLead,
+                                      boolean leadReturnedOnQuit, long createdAtMillis) {
             this.targetUuid = targetUuid;
             this.ownerUuid = ownerUuid;
             this.holderUuid = holderUuid;
+            this.mode = mode;
+            this.anchorLocation = anchorLocation == null ? null : anchorLocation.clone();
+            this.lockLocation = lockLocation == null ? null : lockLocation.clone();
             this.consumedLead = consumedLead;
+            this.leadReturnedOnQuit = leadReturnedOnQuit;
             this.createdAtMillis = createdAtMillis;
         }
 
-        private static PendingReconnectLeash from(LeashSession session, long createdAtMillis) {
+        private static PendingReconnectLeash from(LeashSession session, long createdAtMillis, boolean leadReturnedOnQuit) {
             return new PendingReconnectLeash(
                     session.targetUuid,
                     session.ownerUuid,
                     session.holderUuid,
+                    session.mode,
+                    session.anchorLocation,
+                    session.lockLocation,
                     session.consumedLead,
+                    leadReturnedOnQuit,
                     createdAtMillis
             );
         }
