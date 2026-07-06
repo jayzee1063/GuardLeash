@@ -1,0 +1,24 @@
+name: GuardLeash
+version: 1.0.0
+main: ru.lunify.guardleash.GuardLeashPlugin
+api-version: '1.21'
+authors:
+  - Lunify
+description: Lunify police leash system for players.
+commands:
+  guardleash:
+    description: GuardLeash administration command.
+    usage: /guardleash reload | release <player>
+    aliases:
+      - gleash
+      - lunifyguardleash
+permissions:
+  guardleash.use:
+    description: Allows leashing and unleashing players with a vanilla lead.
+    default: op
+  guardleash.admin:
+    description: Allows reloading config and force-releasing players.
+    default: op
+  guardleash.bypass:
+    description: Prevents the player from being leashed.
+    default: false
